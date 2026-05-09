@@ -1,0 +1,12 @@
+pandas
+mlcroissant
+GitPython
+pyarrow
+datasets
+scikit-learn
+
+#
+# IMPORTANT!!!
+#
+# This script requires Git LFS to handle large files. Please install it before running the script.
+# brew install git-lfs
