@@ -12,6 +12,7 @@ Install deps:
 
 from dataclasses import dataclass, field
 
+import mlflow
 import pandas as pd
 import torch
 from datasets import Dataset, DatasetDict
@@ -31,18 +32,17 @@ from transformers import (
     TrainingArguments,
     DataCollatorWithPadding,
 )
-import mlflow
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
 @dataclass
 class FinetuneConfig:
     # Model
-    base_model: str = "meta-llama/Llama-3.1-8B"   # swap to any seq-cls model
-    use_4bit: bool = True                           # QLoRA; set False for LoRA only
+    base_model: str = "meta-llama/Llama-3.2-1B"   # swap to any seq-cls model
+    use_4bit: bool = False                           # QLoRA; set False for LoRA only
 
     # Data — single CSV or separate train/eval CSVs
-    data_file: str = "dataset/window.csv"          # used when eval_file is None (auto-split)
+    data_file: str = "dataset/ami/ami_full.csv"          # used when eval_file is None (auto-split)
     train_file: str = None               # set explicitly to skip auto-split
     eval_file: str = None
     eval_split: float = 0.15            # fraction held out when auto-splitting
@@ -51,29 +51,29 @@ class FinetuneConfig:
     label_names: list[str] = field(default_factory=lambda: ["no_drift", "drift"])
 
     # LoRA
-    lora_r: int = 16
-    lora_alpha: int = 32
+    lora_r: int = 32
+    lora_alpha: int = 64
     lora_dropout: float = 0.05
     lora_target_modules: list[str] = field(
-        default_factory=lambda: ["q_proj", "v_proj"]
+        default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"]
     )
 
     # Training
     output_dir: str = "./output"
-    num_epochs: int = 3
-    batch_size: int = 8
-    grad_accum_steps: int = 2
-    learning_rate: float = 2e-4
-    max_length: int = 256
-    warmup_ratio: float = 0.1
+    num_epochs: int = 6
+    batch_size: int = 4
+    grad_accum_steps: int = 4
+    learning_rate: float = 3e-5
+    max_length: int = 320
+    warmup_ratio: float = 0.05
     weight_decay: float = 0.01
     save_steps: int = 100
     eval_steps: int = 100
     logging_steps: int = 25
-    fp16: bool = True                              # set False on CPU / MPS
+    fp16: bool = False                              # set False on CPU / MPS
+    bf16: bool = False                             # set True if your GPU supports it (Ampere+)
 
-    # MLFlow
-    mlflow_experiment: str = "drift-classification"
+    experiment_name: str = "drift-classification"
 
 
 
@@ -102,11 +102,6 @@ def make_dataset() -> DatasetDict:
             stratify=df[cfg.label_col],
             random_state=42,
         )
-    
-    print(f"Dataset split: {len(train_df)} train / {len(eval_df)} eval samples")
-    print(f"Label distribution in train: {train_df[cfg.label_col].value_counts().to_dict()}")
-    print(f"Label distribution in eval: {eval_df[cfg.label_col].value_counts().to_dict()}")
-
     return DatasetDict(train=csv_to_hf(train_df), eval=csv_to_hf(eval_df))
 
 
@@ -122,6 +117,16 @@ def tokenise(dataset: DatasetDict, tokenizer: AutoTokenizer) -> DatasetDict:
 
     return dataset.map(_tokenise, batched=True, remove_columns=["text"])
 
+
+def check_token_lengths(dataset: DatasetDict, tokenizer: AutoTokenizer):
+    lengths = [
+        len(tokenizer(text)["input_ids"])
+        for text in dataset["train"]["text"]
+    ]
+    lengths = pd.Series(lengths)
+    print(lengths.describe())
+    print(f"p95: {lengths.quantile(0.95):.0f}")
+    print(f"p99: {lengths.quantile(0.99):.0f}")
 
 # ─── Model ────────────────────────────────────────────────────────────────────
 
@@ -145,9 +150,11 @@ def load_model_and_tokenizer():
         cfg.base_model,
         num_labels=num_labels,
         quantization_config=bnb_config,
-        device_map="auto",
+        device_map="cuda:0",
     )
     model.config.pad_token_id = tokenizer.pad_token_id
+
+    print(f"Using device: {next(model.parameters()).device}")
 
     if cfg.use_4bit:
         model = prepare_model_for_kbit_training(model)
@@ -180,26 +187,12 @@ def compute_metrics(eval_pred):
 # ─── Train ────────────────────────────────────────────────────────────────────
 
 def main():
-    mlflow.set_experiment(cfg.mlflow_experiment)
-    
-    with mlflow.start_run():
-        # log all config fields
-        mlflow.log_params({
-            "base_model": cfg.base_model,
-            "lora_r": cfg.lora_r,
-            "lora_alpha": cfg.lora_alpha,
-            "learning_rate": cfg.learning_rate,
-            "num_epochs": cfg.num_epochs,
-            "batch_size": cfg.batch_size,
-            "use_4bit": cfg.use_4bit,
-            "max_length": cfg.max_length,
-        })
-    
     print("Loading model and tokenizer…")
     model, tokenizer = load_model_and_tokenizer()
 
     print("Loading and tokenising dataset…")
     raw = make_dataset()
+    check_token_lengths(raw, tokenizer)
     tokenised = tokenise(raw, tokenizer)
 
     training_args = TrainingArguments(
@@ -207,7 +200,7 @@ def main():
         num_train_epochs=cfg.num_epochs,
         per_device_train_batch_size=cfg.batch_size,
         per_device_eval_batch_size=cfg.batch_size,
-        gradient_accumulation_steps=cfg.grad_accum_steps,
+        # gradient_accumulation_steps=cfg.grad_accum_steps,
         learning_rate=cfg.learning_rate,
         warmup_ratio=cfg.warmup_ratio,
         weight_decay=cfg.weight_decay,
@@ -219,6 +212,7 @@ def main():
         load_best_model_at_end=True,
         metric_for_best_model="f1",
         fp16=cfg.fp16,
+        bf16=cfg.bf16,
         report_to="none",           # swap to "wandb" if you want experiment tracking
     )
 
@@ -232,21 +226,28 @@ def main():
         compute_metrics=compute_metrics,
     )
 
+    mlflow.set_experiment(cfg.experiment_name)
+
+    mlflow.log_params({
+            "base_model": cfg.base_model,
+            "epochs": cfg.num_epochs,
+            "batch_size": cfg.batch_size,
+            "learning_rate": cfg.learning_rate,
+            "max_length": cfg.max_length,
+            "lora_r": cfg.lora_r,
+            "lora_alpha": cfg.lora_alpha,
+            "lora_dropout": cfg.lora_dropout,
+        })
+
     print("Starting training…")
-    result = trainer.train()
+    trainer.train()
 
-    # log final metrics
-    mlflow.log_metrics({
-        "train_loss": result.training_loss,
-        "eval_f1": trainer.evaluate()["eval_f1"],
-        "eval_accuracy": trainer.evaluate()["eval_accuracy"],
-    })
+    metrics = trainer.evaluate()
+    mlflow.log_metrics(metrics)
 
-    # log the adapter as an artifact
     print(f"Saving adapter to {cfg.output_dir}/best")
     model.save_pretrained(f"{cfg.output_dir}/best")
     tokenizer.save_pretrained(f"{cfg.output_dir}/best")
-    mlflow.log_artifacts(f"{cfg.output_dir}/best", artifact_path="adapter")
     print("Done.")
 
 
