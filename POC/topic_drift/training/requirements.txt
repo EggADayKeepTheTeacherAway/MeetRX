@@ -8,3 +8,6 @@ datasets>=2.18.0
 scikit-learn>=1.3.0
 wandb
 pandas
+unsloth-zoo
+unsloth
+mlflow

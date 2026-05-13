@@ -1,106 +1,164 @@
 """
-Fine-tune Llama 3.1 8B (QLoRA) on topic drift detection
-Usage: python finetune.py
+LLM Fine-tuning Script — Conversation Drift Classification
+HuggingFace Transformers + PEFT (LoRA/QLoRA)
+
+Expects CSV files with at minimum these columns:
+    window_text   — the conversation window (model input)
+    drift_label   — 0 (no drift) or 1 (drift)
+
+Install deps:
+    pip install transformers peft accelerate bitsandbytes datasets scikit-learn pandas
 """
 
-import os
-import torch
+from dataclasses import dataclass, field
+
 import pandas as pd
-from datasets import Dataset
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import f1_score, classification_report
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    BitsAndBytesConfig,
-    TrainingArguments,
+import torch
+from datasets import Dataset, DatasetDict
+from peft import (
+    LoraConfig,
+    TaskType,
+    get_peft_model,
+    prepare_model_for_kbit_training,
 )
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from trl import SFTTrainer, DataCollatorForCompletionOnlyLM
+from sklearn.metrics import accuracy_score, f1_score
+from sklearn.model_selection import train_test_split
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    Trainer,
+    TrainingArguments,
+    DataCollatorWithPadding,
+)
+import mlflow
 
-# ─────────────────────────────────────────────
-# CONFIG — tune these based on your GPU memory
-# ─────────────────────────────────────────────
-MODEL_ID       = "meta-llama/Llama-3.1-8B"
-DATA_PATH      = "windows.csv"
-OUTPUT_DIR     = "./llama-drift-qlora"
-HF_TOKEN       = os.environ.get("HF_TOKEN", "")   # set via: export HF_TOKEN=hf_...
+# ─── Config ───────────────────────────────────────────────────────────────────
 
-MAX_SEQ_LEN    = 512    # lower to 256 if OOM
-BATCH_SIZE     = 2      # lower to 1 if OOM
-GRAD_ACCUM     = 8      # effective batch = BATCH_SIZE * GRAD_ACCUM
-EPOCHS         = 3
-LR             = 2e-4
-LORA_R         = 16     # lower to 8 if OOM
-LORA_ALPHA     = 32
-VAL_SPLIT      = 0.15
-SEED           = 42
-# ─────────────────────────────────────────────
+@dataclass
+class FinetuneConfig:
+    # Model
+    base_model: str = "meta-llama/Llama-3.1-8B"   # swap to any seq-cls model
+    use_4bit: bool = True                           # QLoRA; set False for LoRA only
 
+    # Data — single CSV or separate train/eval CSVs
+    data_file: str = "dataset/window.csv"          # used when eval_file is None (auto-split)
+    train_file: str = None               # set explicitly to skip auto-split
+    eval_file: str = None
+    eval_split: float = 0.15            # fraction held out when auto-splitting
+    text_col: str = "window_text"
+    label_col: str = "drift_label"
+    label_names: list[str] = field(default_factory=lambda: ["no_drift", "drift"])
 
-def format_prompt(row) -> str:
-    """Convert a windows.csv row into an instruction prompt."""
-    label = "yes" if row["drift_label"] == 1 else "no"
-    return (
-        "### Conversation:\n"
-        f"{row['window_text']}\n\n"
-        "### Does this conversation contain a topic shift?\n"
-        f"{label}"
+    # LoRA
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
+    lora_target_modules: list[str] = field(
+        default_factory=lambda: ["q_proj", "v_proj"]
     )
 
+    # Training
+    output_dir: str = "./output"
+    num_epochs: int = 3
+    batch_size: int = 8
+    grad_accum_steps: int = 2
+    learning_rate: float = 2e-4
+    max_length: int = 256
+    warmup_ratio: float = 0.1
+    weight_decay: float = 0.01
+    save_steps: int = 100
+    eval_steps: int = 100
+    logging_steps: int = 25
+    fp16: bool = True                              # set False on CPU / MPS
 
-def load_dataset(path: str):
-    df = pd.read_csv(path)
-    df = df.dropna(subset=["window_text", "drift_label"])
-    df["drift_label"] = df["drift_label"].astype(int)
+    # MLFlow
+    mlflow_experiment: str = "drift-classification"
 
-    print(f"\nDataset: {len(df)} windows")
-    print(f"  Drifted : {df['drift_label'].sum()} ({df['drift_label'].mean()*100:.1f}%)")
-    print(f"  No drift: {(~df['drift_label'].astype(bool)).sum()}\n")
 
-    df["text"] = df.apply(format_prompt, axis=1)
 
-    train_df, val_df = train_test_split(
-        df, test_size=VAL_SPLIT, random_state=SEED, stratify=df["drift_label"]
+cfg = FinetuneConfig()
+
+# ─── Data ─────────────────────────────────────────────────────────────────────
+
+def csv_to_hf(df: pd.DataFrame) -> Dataset:
+    """Keep only the columns the model needs and rename to 'text' / 'label'."""
+    df = df[[cfg.text_col, cfg.label_col]].rename(
+        columns={cfg.text_col: "text", cfg.label_col: "label"}
     )
+    df["label"] = df["label"].astype(int)
+    return Dataset.from_pandas(df, preserve_index=False)
 
-    train_ds = Dataset.from_pandas(train_df[["text"]].reset_index(drop=True))
-    val_ds   = Dataset.from_pandas(val_df[["text", "drift_label"]].reset_index(drop=True))
 
-    return train_ds, val_ds, val_df
+def make_dataset() -> DatasetDict:
+    if cfg.train_file and cfg.eval_file:
+        train_df = pd.read_csv(cfg.train_file)
+        eval_df = pd.read_csv(cfg.eval_file)
+    else:
+        df = pd.read_csv(cfg.data_file)
+        train_df, eval_df = train_test_split(
+            df,
+            test_size=cfg.eval_split,
+            stratify=df[cfg.label_col],
+            random_state=42,
+        )
+    
+    print(f"Dataset split: {len(train_df)} train / {len(eval_df)} eval samples")
+    print(f"Label distribution in train: {train_df[cfg.label_col].value_counts().to_dict()}")
+    print(f"Label distribution in eval: {eval_df[cfg.label_col].value_counts().to_dict()}")
 
+    return DatasetDict(train=csv_to_hf(train_df), eval=csv_to_hf(eval_df))
+
+
+# ─── Tokenise ─────────────────────────────────────────────────────────────────
+
+def tokenise(dataset: DatasetDict, tokenizer: AutoTokenizer) -> DatasetDict:
+    def _tokenise(batch):
+        return tokenizer(
+            batch["text"],
+            truncation=True,
+            max_length=cfg.max_length,
+        )
+
+    return dataset.map(_tokenise, batched=True, remove_columns=["text"])
+
+
+# ─── Model ────────────────────────────────────────────────────────────────────
 
 def load_model_and_tokenizer():
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4",
-    )
+    num_labels = len(cfg.label_names)
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        MODEL_ID, token=HF_TOKEN, trust_remote_code=True
-    )
-    tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
+    tokenizer = AutoTokenizer.from_pretrained(cfg.base_model)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID,
+    bnb_config = None
+    if cfg.use_4bit:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+        )
+
+    model = AutoModelForSequenceClassification.from_pretrained(
+        cfg.base_model,
+        num_labels=num_labels,
         quantization_config=bnb_config,
         device_map="auto",
-        token=HF_TOKEN,
-        trust_remote_code=True,
     )
-    model = prepare_model_for_kbit_training(model)
+    model.config.pad_token_id = tokenizer.pad_token_id
+
+    if cfg.use_4bit:
+        model = prepare_model_for_kbit_training(model)
 
     lora_config = LoraConfig(
-        r=LORA_R,
-        lora_alpha=LORA_ALPHA,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                        "gate_proj", "up_proj", "down_proj"],
-        lora_dropout=0.05,
+        task_type=TaskType.SEQ_CLS,
+        r=cfg.lora_r,
+        lora_alpha=cfg.lora_alpha,
+        lora_dropout=cfg.lora_dropout,
+        target_modules=cfg.lora_target_modules,
         bias="none",
-        task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
@@ -108,87 +166,109 @@ def load_model_and_tokenizer():
     return model, tokenizer
 
 
-def evaluate(model, tokenizer, val_df: pd.DataFrame):
-    """Run greedy decode on val set and compute F1."""
-    model.eval()
-    preds, labels = [], []
+# ─── Metrics ──────────────────────────────────────────────────────────────────
 
-    for _, row in val_df.iterrows():
-        prompt = (
-            "### Conversation:\n"
-            f"{row['window_text']}\n\n"
-            "### Does this conversation contain a topic shift?\n"
-        )
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True,
-                           max_length=MAX_SEQ_LEN).to(model.device)
-        with torch.no_grad():
-            out = model.generate(**inputs, max_new_tokens=3, do_sample=False)
-        decoded = tokenizer.decode(out[0][inputs["input_ids"].shape[1]:],
-                                   skip_special_tokens=True).strip().lower()
-        pred = 1 if "yes" in decoded else 0
-        preds.append(pred)
-        labels.append(int(row["drift_label"]))
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    preds = logits.argmax(axis=-1)
+    return {
+        "accuracy": accuracy_score(labels, preds),
+        "f1": f1_score(labels, preds, average="weighted"),
+    }
 
-    print("\n── Evaluation ──────────────────────────")
-    print(classification_report(labels, preds, target_names=["no drift", "drift"]))
-    print(f"Macro F1: {f1_score(labels, preds, average='macro'):.4f}")
-    print("────────────────────────────────────────\n")
 
+# ─── Train ────────────────────────────────────────────────────────────────────
 
 def main():
-    print("Loading data...")
-    train_ds, val_ds, val_df = load_dataset(DATA_PATH)
-
-    print("Loading model...")
+    mlflow.set_experiment(cfg.mlflow_experiment)
+    
+    with mlflow.start_run():
+        # log all config fields
+        mlflow.log_params({
+            "base_model": cfg.base_model,
+            "lora_r": cfg.lora_r,
+            "lora_alpha": cfg.lora_alpha,
+            "learning_rate": cfg.learning_rate,
+            "num_epochs": cfg.num_epochs,
+            "batch_size": cfg.batch_size,
+            "use_4bit": cfg.use_4bit,
+            "max_length": cfg.max_length,
+        })
+    
+    print("Loading model and tokenizer…")
     model, tokenizer = load_model_and_tokenizer()
 
-    # Only compute loss on the answer token(s), not the prompt
-    response_template = "### Does this conversation contain a topic shift?\n"
-    collator = DataCollatorForCompletionOnlyLM(
-        response_template, tokenizer=tokenizer
-    )
+    print("Loading and tokenising dataset…")
+    raw = make_dataset()
+    tokenised = tokenise(raw, tokenizer)
 
     training_args = TrainingArguments(
-        output_dir=OUTPUT_DIR,
-        per_device_train_batch_size=BATCH_SIZE,
-        gradient_accumulation_steps=GRAD_ACCUM,
-        num_train_epochs=EPOCHS,
-        learning_rate=LR,
-        bf16=torch.cuda.is_bf16_supported(),
-        fp16=not torch.cuda.is_bf16_supported(),
-        logging_steps=10,
-        save_strategy="epoch",
-        eval_strategy="epoch",
-        warmup_ratio=0.05,
-        lr_scheduler_type="cosine",
-        report_to="none",           # change to "wandb" if you want tracking
+        output_dir=cfg.output_dir,
+        num_train_epochs=cfg.num_epochs,
+        per_device_train_batch_size=cfg.batch_size,
+        per_device_eval_batch_size=cfg.batch_size,
+        gradient_accumulation_steps=cfg.grad_accum_steps,
+        learning_rate=cfg.learning_rate,
+        warmup_ratio=cfg.warmup_ratio,
+        weight_decay=cfg.weight_decay,
+        eval_strategy="steps",
+        eval_steps=cfg.eval_steps,
+        save_strategy="steps",
+        save_steps=cfg.save_steps,
+        logging_steps=cfg.logging_steps,
         load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
+        metric_for_best_model="f1",
+        fp16=cfg.fp16,
+        report_to="none",           # swap to "wandb" if you want experiment tracking
     )
 
-    trainer = SFTTrainer(
+    trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=train_ds,
-        eval_dataset=val_ds,
-        tokenizer=tokenizer,
-        data_collator=collator,
-        max_seq_length=MAX_SEQ_LEN,
-        dataset_text_field="text",
+        train_dataset=tokenised["train"],
+        eval_dataset=tokenised["eval"],
+        processing_class=tokenizer,
+        data_collator=DataCollatorWithPadding(tokenizer),
+        compute_metrics=compute_metrics,
     )
 
-    print("Starting training...")
-    trainer.train()
+    print("Starting training…")
+    result = trainer.train()
 
-    print("Saving LoRA adapter...")
-    trainer.save_model(OUTPUT_DIR)
-    tokenizer.save_pretrained(OUTPUT_DIR)
+    # log final metrics
+    mlflow.log_metrics({
+        "train_loss": result.training_loss,
+        "eval_f1": trainer.evaluate()["eval_f1"],
+        "eval_accuracy": trainer.evaluate()["eval_accuracy"],
+    })
 
-    print("Running evaluation...")
-    evaluate(model, tokenizer, val_df)
+    # log the adapter as an artifact
+    print(f"Saving adapter to {cfg.output_dir}/best")
+    model.save_pretrained(f"{cfg.output_dir}/best")
+    tokenizer.save_pretrained(f"{cfg.output_dir}/best")
+    mlflow.log_artifacts(f"{cfg.output_dir}/best", artifact_path="adapter")
+    print("Done.")
 
-    print(f"\nDone. Adapter saved to: {OUTPUT_DIR}")
-    print("To merge weights later, run: python merge.py")
+
+# ─── Inference helper ─────────────────────────────────────────────────────────
+
+def predict(text: str, model_dir: str = f"{cfg.output_dir}/best") -> str:
+    """Load the saved adapter and run a single prediction."""
+    from peft import PeftModel
+
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    base = AutoModelForSequenceClassification.from_pretrained(
+        cfg.base_model, num_labels=len(cfg.label_names), device_map="auto"
+    )
+    model = PeftModel.from_pretrained(base, model_dir)
+    model.eval()
+
+    inputs = tokenizer(str(text), return_tensors="pt", truncation=True, max_length=cfg.max_length)
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+    with torch.no_grad():
+        logits = model(**inputs).logits
+    idx = logits.argmax(-1).item()
+    return cfg.label_names[idx]
 
 
 if __name__ == "__main__":
