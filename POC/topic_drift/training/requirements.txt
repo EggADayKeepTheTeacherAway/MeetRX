@@ -11,3 +11,4 @@ pandas
 unsloth-zoo
 unsloth
 mlflow
+uvicorn
