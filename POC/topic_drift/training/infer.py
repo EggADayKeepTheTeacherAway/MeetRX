@@ -1,21 +1,21 @@
 """
 Run inference with the fine-tuned model.
-Usage: python infer.py "hey do you love cats? ... wow that is a lot lol"
+Usage: python infer.py "<topic>" "<transcript>"
+
+Example:
+    python infer.py "budget discussion" "A: Let's go over Q3 spending. B: We're over by 10k."
 """
 
 import sys
 import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from peft import PeftModel
 
-# Use merged model if available, otherwise load adapter
-MODEL_PATH  = "./llama-drift-merged"   # or "./llama-drift-qlora" for adapter only
+MODEL_PATH  = "./llama-drift-merged"
 MAX_SEQ_LEN = 320
 LABEL_NAMES = ["no_drift", "drift"]
 
 
 def predict(topic: str, text: str, model, tokenizer) -> dict:
-    
     combined_text = (
         f"Topic: {topic}\n"
         f"Transcript: {text}"
@@ -25,18 +25,13 @@ def predict(topic: str, text: str, model, tokenizer) -> dict:
         combined_text,
         return_tensors="pt",
         truncation=True,
-        max_length=cfg.max_length,
+        max_length=MAX_SEQ_LEN,
         padding=True,
     )
-
-    inputs = {
-        k: v.to(model.device)
-        for k, v in inputs.items()
-    }
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
     with torch.no_grad():
-        outputs = model(**inputs)
-        logits = outputs.logits
+        logits = model(**inputs).logits
 
     probs = torch.softmax(logits, dim=-1).squeeze()
     pred  = logits.argmax(-1).item()
@@ -51,10 +46,21 @@ def predict(topic: str, text: str, model, tokenizer) -> dict:
 
 
 def main():
-    text = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else (
-        "hey do you love cats? i have two cats and 1000 hats for them! "
-        "what is your favorite season? mine is winter!"
-    )
+    if len(sys.argv) >= 3:
+        topic = sys.argv[1]
+        text  = " ".join(sys.argv[2:])
+    elif len(sys.argv) == 2:
+        print("Usage: python infer.py \"<topic>\" \"<transcript>\"")
+        sys.exit(1)
+    else:
+        # default demo
+        topic = "budget discussion"
+        text  = (
+            "A: Let's go over Q3 spending. "
+            "B: We're over by ten thousand. "
+            "A: We need to cut the hardware order. "
+            "C: Did anyone watch the game last night?"
+        )
 
     print("Loading model...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
@@ -62,15 +68,16 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     model = AutoModelForSequenceClassification.from_pretrained(
-        MODEL_PATH,          # merged model, no adapter needed
+        MODEL_PATH,
         num_labels=2,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
         device_map="auto",
     )
     model.eval()
 
-    result = predict(text, model, tokenizer)
-    print(f"\nInput   : {text[:120]}...")
+    result = predict(topic, text, model, tokenizer)
+    print(f"\nTopic   : {topic}")
+    print(f"Input   : {text[:120]}...")
     print(f"Drift   : {'YES' if result['drift'] else 'NO'}")
     print(f"Output  : {result}")
 
