@@ -149,33 +149,35 @@ def load_dataset() -> pd.DataFrame | None:
         return None
     df = pd.read_csv(path)
     df = df.dropna(subset=["window_text"])
-    df = df[df["window_text"].str.len() >= 100]
     return df
 
 
 # ── Inference ─────────────────────────────────────────────────────────────────
-def predict(text: str, tokenizer, model) -> dict:
+def predict(topic: str, text: str, tokenizer, model) -> dict:
+    combined_text = f"Topic: {topic}\nTranscript: {text}"
+
     inputs = tokenizer(
-        text,
+        combined_text,
         return_tensors="pt",
         truncation=True,
         max_length=MAX_SEQ_LEN,
         padding=True,
     )
+
     inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
     with torch.no_grad():
         logits = model(**inputs).logits
 
     probs = torch.softmax(logits, dim=-1).squeeze()
-    pred  = logits.argmax(-1).item()
+    pred = logits.argmax(-1).item()
 
     return {
-        "label":         LABEL_NAMES[pred],
-        "drift":         pred == 1,
-        "confidence":    round(probs[pred].item(), 4),
+        "label": LABEL_NAMES[pred],
+        "drift": pred == 1,
+        "confidence": round(probs[pred].item(), 4),
         "no_drift_prob": round(probs[0].item(), 4),
-        "drift_prob":    round(probs[1].item(), 4),
+        "drift_prob": round(probs[1].item(), 4),
     }
 
 
@@ -199,6 +201,57 @@ except Exception as e:
 # Load dataset (optional)
 df = load_dataset()
 
+# ── Test scenarios ────────────────────────────────────────────────────────────
+TEST_SCENARIOS = {
+    "Test Scenario 1": {
+        "turns": [
+            ("A", "We should review the structure of the marketing presentation one more time."),
+            ("B", "The product overview section is ready, including the updated customer insights."),
+            ("C", "I added the campaign performance graphs from the latest analytics report."),
+            ("A", "Great, let's make sure the transition between slides feels smooth."),
+            ("B", "The audience engagement numbers are strongest on the social media campaign slide."),
+            ("C", "I also included a short competitor comparison near the end."),
+            ("A", "Can we shorten the text on the strategy slide a little?"),
+            ("B", "Yeah, I'll replace a few paragraphs with bullet points."),
+            ("C", "Do we still want the testimonial quotes in the conclusion section?"),
+            ("A", "Definitely, they help reinforce the overall message of the presentation."),
+        ],
+        "meta": {"agenda": "marketing_presentation", "expected": "NO DRIFT"},
+    },
+    "Test Scenario 2": {
+        "turns": [
+            ("A", "We need to finalize the financial planning report before next week's review."),
+            ("B", "Current projections show operating expenses increasing by around ten percent."),
+            ("C", "We should find some cheap solutions to maybe cut some costs."),
+            ("A", "Have anyone tried the new AI web dev app, Lovable?"),
+            ("B", "Yeah, it was amazing."),
+            ("C", "I built a ramen recipe website with just a prompt."),
+            ("A", "It even generated responsive layouts automatically."),
+            ("B", "I saw someone make an e-commerce app in under an hour."),
+            ("C", "The AI-generated animations were surprisingly smooth too."),
+            ("B", "I liked the demo where you can drag and tear paper with your cursor"),
+            ("A", "Anyway, we should probably get back to the finance planning discussion."),
+        ],
+        "meta": {"agenda": "finance_planning", "expected": "DRIFT"},
+    },
+
+    "Test Scenario 3": {
+        "turns": [
+            ("A", "Let's discuss the new dashboard layout for the application."),
+            ("B", "Users said the navigation menu feels a little crowded."),
+            ("C", "We could simplify the icons and reduce the amount of text."),
+            ("A", "Performance metrics should still remain visible on the home screen."),
+            ("B", "Maybe adding a collapsible sidebar would help usability."),
+            ("C", "That sounds reasonable, although we should validate it with user testing."),
+            ("A", "Some users also requested customizable widget placement."),
+            ("B", "That might improve engagement for power users."),
+            ("C", "We just need to make sure the interface does not become overwhelming."),
+            ("A", "Agreed, keeping the layout clean should remain the priority."),
+        ],
+        "meta": {"agenda": "ui_design_discussion", "expected": "VAGUE DRIFT"},
+    },
+}
+
 # ── Input area ────────────────────────────────────────────────────────────────
 col_label, col_btn = st.columns([3, 1])
 with col_label:
@@ -209,6 +262,15 @@ with col_btn:
     else:
         st.caption("No dataset found")
         pull = False
+
+scen_cols = st.columns(3)
+scenario_picked = None
+scenario_meta = None
+for idx, (label, scenario) in enumerate(TEST_SCENARIOS.items()):
+    with scen_cols[idx]:
+        if st.button(label, use_container_width=True):
+            scenario_picked = scenario["turns"]
+            scenario_meta = scenario["meta"]
 
 # ── Turn parser ───────────────────────────────────────────────────────────────
 def parse_turns(raw: str) -> list[tuple[str, str]]:
@@ -240,6 +302,7 @@ def turns_to_text(turns: list[tuple[str, str]]) -> str:
     return "\n".join(f"{spk}: {utt}" for spk, utt in turns)
 
 
+
 # ── Default turns ─────────────────────────────────────────────────────────────
 DEFAULT_TURNS = [
     ("A", "Okay so let's move on to the budget section."),
@@ -247,13 +310,13 @@ DEFAULT_TURNS = [
     ("A", "And the projection for Q4 looks similar."),
     ("B", "Actually, did anyone watch the game last night? Incredible match."),
 ]
- 
+
 if "turns" not in st.session_state:
     st.session_state.turns = DEFAULT_TURNS
 if "turn_version" not in st.session_state:
     st.session_state.turn_version = 0
- 
- 
+
+
 # ── Random sample pull ────────────────────────────────────────────────────────
 if pull and df is not None:
     row = df.sample(1).iloc[0]
@@ -265,7 +328,17 @@ if pull and df is not None:
         "label":    int(row.get("drift_label", -1)),
     }
     st.rerun()
- 
+
+if scenario_picked is not None:
+    st.session_state.turns = scenario_picked
+    st.session_state.turn_version += 1
+    st.session_state.sample_meta = {
+        "session":  "—",
+        "agenda":   scenario_meta["agenda"],
+        "label":    1 if scenario_meta["expected"] == "DRIFT" else 0,
+    }
+    st.rerun()
+
 # ── Per-turn inputs ───────────────────────────────────────────────────────────
 if "sample_meta" in st.session_state:
     m = st.session_state.sample_meta
@@ -277,9 +350,21 @@ if "sample_meta" in st.session_state:
         f"</div>",
         unsafe_allow_html=True,
     )
- 
+
+st.markdown("**Meeting topic / agenda**")
+
+default_topic = ""
+if "sample_meta" in st.session_state:
+    default_topic = st.session_state.sample_meta.get("agenda", "")
+
+topic_input = st.text_input(
+    "Meeting topic",
+    value=default_topic,
+    placeholder="e.g. finance_planning",
+)
+
 st.markdown("**Transcript turns**")
- 
+
 # Use version-stamped keys so Streamlit treats them as brand-new widgets
 # whenever turns are replaced, forcing value= to take effect.
 v = st.session_state.turn_version
@@ -288,18 +373,20 @@ for i, (spk, utt) in enumerate(st.session_state.turns):
     col_spk, col_utt = st.columns([1, 6])
     with col_spk:
         new_spk = st.text_input(
-            label=f"spkr_{v}_{i}",
-            label_visibility="collapsed",
+            label=f"spk_{v}_{i}",
             value=spk,
+            label_visibility="collapsed",
+            key=f"spk_{v}_{i}",
         )
     with col_utt:
         new_utt = st.text_input(
             label=f"utt_{v}_{i}",
-            label_visibility="collapsed",
             value=utt,
+            label_visibility="collapsed",
+            key=f"utt_{v}_{i}",
         )
     edited_turns.append((new_spk.strip(), new_utt.strip()))
- 
+
 # Add / remove turn buttons
 col_add, col_rem, col_run = st.columns([1, 1, 4])
 with col_add:
@@ -316,25 +403,27 @@ with col_rem:
         st.rerun()
 with col_run:
     run = st.button("▶  Run inference", type="primary", use_container_width=True)
- 
+
 # Assemble final text from edited turns
 text_input = turns_to_text(edited_turns)
- 
+
 # ── Result ────────────────────────────────────────────────────────────────────
 if run:
-    if not text_input.strip():
-        st.warning("Please enter some text first.")
+    if not topic_input.strip():
+        st.warning("Please enter a meeting topic / agenda.")
+    elif not text_input.strip():
+        st.warning("Please enter some transcript text first.")
     else:
         with st.spinner("Running…"):
-            result = predict(text_input.strip(), tokenizer, model)
- 
+            result = predict(topic_input.strip(), text_input.strip(), tokenizer, model)
+
         card_class = "drift-yes" if result["drift"] else "drift-no"
         verdict    = "⚠ DRIFT DETECTED" if result["drift"] else "✓ ON TOPIC"
         conf_pct   = f"{result['confidence']*100:.1f}%"
         nd_pct     = f"{result['no_drift_prob']*100:.1f}%"
         d_pct      = f"{result['drift_prob']*100:.1f}%"
         badge      = "badge-drift" if result["drift"] else "badge-nodrift"
- 
+
         st.markdown(f"""
         <div class="{card_class}">
             <div style="font-family:'Syne',sans-serif;font-size:20px;font-weight:800;
@@ -357,7 +446,7 @@ if run:
             </div>
         </div>
         """, unsafe_allow_html=True)
- 
+
 # ── Footer ────────────────────────────────────────────────────────────────────
 st.markdown("<hr class='divider'>", unsafe_allow_html=True)
 st.markdown(
