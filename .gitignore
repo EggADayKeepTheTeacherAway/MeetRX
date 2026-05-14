@@ -216,3 +216,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# MLFlow
+output/
+mlruns/
+mlflow.db
+*.bin
+*.safetensors
+*.pt
+*.ckpt
+
+# Data
+*.csv
+*.jsonl
+*.json
