@@ -14,18 +14,29 @@ MAX_SEQ_LEN = 320
 LABEL_NAMES = ["no_drift", "drift"]
 
 
-def predict(text: str, model, tokenizer) -> dict:
+def predict(topic: str, text: str, model, tokenizer) -> dict:
+    
+    combined_text = (
+        f"Topic: {topic}\n"
+        f"Transcript: {text}"
+    )
+
     inputs = tokenizer(
-        text,
+        combined_text,
         return_tensors="pt",
         truncation=True,
-        max_length=MAX_SEQ_LEN,
+        max_length=cfg.max_length,
         padding=True,
     )
-    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+    inputs = {
+        k: v.to(model.device)
+        for k, v in inputs.items()
+    }
 
     with torch.no_grad():
-        logits = model(**inputs).logits
+        outputs = model(**inputs)
+        logits = outputs.logits
 
     probs = torch.softmax(logits, dim=-1).squeeze()
     pred  = logits.argmax(-1).item()

@@ -21,6 +21,8 @@ from peft import (
     TaskType,
     get_peft_model,
     prepare_model_for_kbit_training,
+    PeftModel
+
 )
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.model_selection import train_test_split
@@ -47,6 +49,7 @@ class FinetuneConfig:
     eval_file: str = None
     eval_split: float = 0.15            # fraction held out when auto-splitting
     text_col: str = "window_text"
+    topic_col: str = "agenda_item"
     label_col: str = "drift_label"
     label_names: list[str] = field(default_factory=lambda: ["no_drift", "drift"])
 
@@ -81,12 +84,20 @@ cfg = FinetuneConfig()
 
 # ─── Data ─────────────────────────────────────────────────────────────────────
 
-def csv_to_hf(df: pd.DataFrame) -> Dataset:
-    """Keep only the columns the model needs and rename to 'text' / 'label'."""
-    df = df[[cfg.text_col, cfg.label_col]].rename(
-        columns={cfg.text_col: "text", cfg.label_col: "label"}
+def csv_to_df(df: pd.DataFrame) -> Dataset:
+    """Combine topic + conversation into a single model input."""
+
+    df["text"] = (
+        "Topic: " + df[cfg.topic_col].astype(str)
+        + "\nTranscript: " + df[cfg.text_col].astype(str)
     )
+
+    df = df[["text", cfg.label_col]].rename(
+        columns={cfg.label_col: "label"}
+    )
+
     df["label"] = df["label"].astype(int)
+
     return Dataset.from_pandas(df, preserve_index=False)
 
 
@@ -102,7 +113,7 @@ def make_dataset() -> DatasetDict:
             stratify=df[cfg.label_col],
             random_state=42,
         )
-    return DatasetDict(train=csv_to_hf(train_df), eval=csv_to_hf(eval_df))
+    return DatasetDict(train=csv_to_df(train_df), eval=csv_to_df(eval_df))
 
 
 # ─── Tokenise ─────────────────────────────────────────────────────────────────
@@ -253,23 +264,57 @@ def main():
 
 # ─── Inference helper ─────────────────────────────────────────────────────────
 
-def predict(text: str, model_dir: str = f"{cfg.output_dir}/best") -> str:
-    """Load the saved adapter and run a single prediction."""
-    from peft import PeftModel
+def predict(
+    topic: str,
+    transcript: str,
+    model_dir: str = f"{cfg.output_dir}/best",
+):
 
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
-    base = AutoModelForSequenceClassification.from_pretrained(
-        cfg.base_model, num_labels=len(cfg.label_names), device_map="auto"
+
+    base_model = AutoModelForSequenceClassification.from_pretrained(
+        cfg.base_model,
+        num_labels=len(cfg.label_names),
+        device_map="auto",
     )
-    model = PeftModel.from_pretrained(base, model_dir)
+
+    model = PeftModel.from_pretrained(base_model, model_dir)
     model.eval()
 
-    inputs = tokenizer(str(text), return_tensors="pt", truncation=True, max_length=cfg.max_length)
-    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+    combined_text = (
+        f"Topic: {topic}\n"
+        f"Transcript: {transcript}"
+    )
+
+    inputs = tokenizer(
+        combined_text,
+        return_tensors="pt",
+        truncation=True,
+        max_length=cfg.max_length,
+        padding=True,
+    )
+
+    inputs = {
+        k: v.to(model.device)
+        for k, v in inputs.items()
+    }
+
     with torch.no_grad():
-        logits = model(**inputs).logits
-    idx = logits.argmax(-1).item()
-    return cfg.label_names[idx]
+        outputs = model(**inputs)
+        logits = outputs.logits
+
+    probs = torch.softmax(logits, dim=-1).squeeze()
+    pred_idx = logits.argmax(dim=-1).item()
+
+    return {
+        "label": cfg.label_names[pred_idx],
+        "drift": pred_idx == 1,
+        "confidence": round(probs[pred_idx].item(), 4),
+        "probabilities": {
+            cfg.label_names[i]: round(probs[i].item(), 4)
+            for i in range(len(cfg.label_names))
+        },
+    }
 
 
 if __name__ == "__main__":
