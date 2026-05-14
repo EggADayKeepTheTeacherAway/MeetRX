@@ -205,18 +205,16 @@ df = load_dataset()
 TEST_SCENARIOS = {
     "Test Scenario 1": {
         "turns": [
-            ("A", "We should review the structure of the marketing presentation one more time."),
-            ("B", "The product overview section is ready, including the updated customer insights."),
-            ("C", "I added the campaign performance graphs from the latest analytics report."),
-            ("A", "Great, let's make sure the transition between slides feels smooth."),
-            ("B", "The audience engagement numbers are strongest on the social media campaign slide."),
-            ("C", "I also included a short competitor comparison near the end."),
-            ("A", "Can we shorten the text on the strategy slide a little?"),
-            ("B", "Yeah, I'll replace a few paragraphs with bullet points."),
-            ("C", "Do we still want the testimonial quotes in the conclusion section?"),
-            ("A", "Definitely, they help reinforce the overall message of the presentation."),
+            ("A", "So the projected cost for the remote is around twenty five euros."),
+            ("B", "That's within the target range we set at the start."),
+            ("A", "The L C D screen is the most expensive component."),
+            ("C", "We could look at a cheaper display if we need to cut costs."),
+            ("B", "The scroll wheel is about two euros extra per unit."),
+            ("A", "Still under budget if we drop the voice input for now."),
+            ("C", "Right so total unit cost stays around twenty five."),
+            ("B", "That works for the production volume we are targeting."),
         ],
-        "meta": {"agenda": "marketing_presentation", "expected": "NO DRIFT"},
+        "meta": {"agenda": "budget discussion", "expected": "NO DRIFT"},
     },
     "Test Scenario 2": {
         "turns": [
@@ -232,7 +230,7 @@ TEST_SCENARIOS = {
             ("B", "I liked the demo where you can drag and tear paper with your cursor"),
             ("A", "Anyway, we should probably get back to the finance planning discussion."),
         ],
-        "meta": {"agenda": "finance_planning", "expected": "DRIFT"},
+        "meta": {"agenda": "finance planning", "expected": "DRIFT"},
     },
 
     "Test Scenario 3": {
@@ -248,7 +246,7 @@ TEST_SCENARIOS = {
             ("C", "We just need to make sure the interface does not become overwhelming."),
             ("A", "Agreed, keeping the layout clean should remain the priority."),
         ],
-        "meta": {"agenda": "ui_design_discussion", "expected": "VAGUE DRIFT"},
+        "meta": {"agenda": "ui design discussion", "expected": "VAGUE DRIFT"},
     },
 }
 
