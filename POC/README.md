@@ -20,6 +20,7 @@ POC/
 │       ├── mlruns/                       # MLflow experiment tracking
 │       ├── output/                       # Training checkpoints
 │       ├── finetune.py                   # LoRA fine-tuning script
+│       ├── infer_server.py               # API inference endpoint
 │       ├── infer.py                      # CLI inference script
 │       ├── merge.py                      # Merge LoRA adapter into base model
 │       ├── mlflow.db                     # MLflow local database
@@ -124,6 +125,16 @@ The Streamlit app (`main.py`) provides:
 - **🎲 Random sample** — pulls a window from `ami_full.csv` with its true label
 - **Test Scenario 1–3** — pre-loaded transcripts covering on-topic and drift cases
 - **Inference result card** — shows verdict, confidence, and per-class probabilities
+
+---
+
+## Demo API endpoint
+
+Run the `infer_server.py` script directly.
+
+```bash
+python topic_drift/training/infer_server.py
+```
 
 ---
 
