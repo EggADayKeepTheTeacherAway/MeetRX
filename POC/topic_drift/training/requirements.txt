@@ -12,3 +12,7 @@ unsloth-zoo
 unsloth
 mlflow
 uvicorn
+seaborn
+matplotlib
+shap
+lime
