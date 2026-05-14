@@ -99,25 +99,26 @@ def build_windows(acts: list[dict], window_sec: float, stride_sec: float) -> lis
     Slide a fixed-duration window over a list of dialogue acts using stride_sec
     so consecutive windows overlap. A window is kept only if it contains at
     least 30 tokens (words) to filter out sparse segments.
- 
+
     Returns list of {time_start, time_end, window_text}.
     """
     if not acts:
         return []
- 
-    MIN_TOKENS = 36
- 
+
+    MIN_CHARS  = 100
+    MIN_TOKENS = 30
+
     windows = []
     start = acts[0]["starttime"]
     end_of_acts = acts[-1]["endtime"]
- 
+
     while start < end_of_acts:
         end = start + window_sec
         chunk = [a for a in acts if a["starttime"] >= start and a["endtime"] <= end]
         if chunk:
             text = " ".join(f"{a['speaker']}: {a['text']}" for a in chunk)
             # ── Step 1 fix: drop windows that are too sparse ──────────────────
-            if len(text.split()) >= MIN_TOKENS:
+            if len(text) >= MIN_CHARS and len(text.split()) >= MIN_TOKENS:
                 windows.append({
                     "time_start":  round(start, 2),
                     "time_end":    round(end, 2),
@@ -125,7 +126,7 @@ def build_windows(acts: list[dict], window_sec: float, stride_sec: float) -> lis
                 })
         # ── Step 1 fix: advance by stride, not by full window ─────────────────
         start += stride_sec
- 
+
     return windows
 
 
@@ -219,10 +220,13 @@ def build_dataset(
             })
 
     # ── negatives from excluded agenda items ──────────────────────────────────
-    # Each excluded window is paired with a random real agenda_item → drift=1.
-    # This injects topic-neutral content (chitchat, openings, etc.) as negatives
-    # without anchoring them to any specific agenda class.
-    for w in excluded_windows:
+    # Cap to total positives so excluded windows don't inflate drift ratio.
+    n_pos_total = sum(1 for r in rows if r["drift_label"] == 0)
+    n_neg_so_far = sum(1 for r in rows if r["drift_label"] == 1)
+    n_excluded_budget = max(0, n_pos_total - n_neg_so_far)
+
+    rng.shuffle(excluded_windows)
+    for w in excluded_windows[:n_excluded_budget]:
         assigned_agenda = rng.choice(real_agenda_labels)
         rows.append({
             "meeting_id":  w["meeting_id"],
@@ -234,7 +238,19 @@ def build_dataset(
             "drift_label": 1,
         })
 
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+
+    # ── enforce global 50/50 by downsampling the majority class ───────────────
+    pos = df[df["drift_label"] == 0]
+    neg = df[df["drift_label"] == 1]
+    n   = min(len(pos), len(neg))
+    df  = pd.concat([
+        pos.sample(n, random_state=seed),
+        neg.sample(n, random_state=seed),
+    ]).sample(frac=1, random_state=seed).reset_index(drop=True)
+
+    print(f"  balanced total : {len(df)}  drift ratio: {df['drift_label'].mean():.2f}")
+    return df
 
 
 # ─── Split ────────────────────────────────────────────────────────────────────
@@ -274,7 +290,7 @@ def split_dataset(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ami_dir",    type=str,   default=None)
+    parser.add_argument("--ami_dir",    type=str,   default="topics")
     parser.add_argument("--icsi_dir",   type=str,   default=None)
     parser.add_argument("--output_dir", type=str,   default="dataset")
     parser.add_argument("--window_sec", type=float, default=50.0)
